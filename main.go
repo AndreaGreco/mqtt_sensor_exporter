@@ -5,101 +5,44 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/prometheus/client_golang/prometheus"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"gopkg.in/yaml.v2"
 )
 
 type config struct {
-	Probes []probeConfig `yaml:"probes"`
-}
-
-type probeConfig struct {
-	Name         string        `yaml:"name"`
-	Broker       string        `yaml:"broker_url"`
-	Topic        string        `yaml:"topic"`
-	ClientPrefix string        `yaml:"client_prefix"`
-	Username     string        `yaml:"username"`
-	Password     string        `yaml:"password"`
-	ClientCert   string        `yaml:"client_cert"`
-	ClientKey    string        `yaml:"client_key"`
-	CAChain      string        `yaml:"ca_chain"`
-	Messages     int           `yaml:"messages"`
-	TestInterval time.Duration `yaml:"interval"`
+	Name           string        `yaml:"name"`
+	Broker         string        `yaml:"broker_url"`
+	Topic          string        `yaml:"topic"`
+	ClientName     string        `yaml:"client_name"`
+	Username       string        `yaml:"username"`
+	Password       string        `yaml:"password"`
+	ClientCert     string        `yaml:"client_cert"`
+	ClientKey      string        `yaml:"client_key"`
+	CAChain        string        `yaml:"ca_chain"`
+	Ds18b20Timeout time.Duration `yaml:"ds18b20_timeout"`
 }
 
 var build string
+var conf config
 
 var (
-	messagesPublished = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "probe_mqtt_messages_published_total",
-			Help: "Number of published messages.",
-		}, []string{"name", "broker"})
-
-	messagesReceived = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "probe_mqtt_messages_received_total",
-			Help: "Number of received messages.",
-		}, []string{"name", "broker"})
-
-	timedoutTests = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "probe_mqtt_timeouts_total",
-			Help: "Number of timed out tests.",
-		}, []string{"name", "broker"})
-
-	probeStarted = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "probe_mqtt_started_total",
-			Help: "Number of started probes.",
-		}, []string{"name", "broker"})
-
-	probeCompleted = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "probe_mqtt_completed_total",
-			Help: "Number of completed probes.",
-		}, []string{"name", "broker"})
-
-	errors = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "probe_mqtt_errors_total",
-			Help: "Number of errors occurred during test execution.",
-		}, []string{"name", "broker"})
-
-	probeDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name: "probe_mqtt_duration_seconds",
-			Help: "Time taken to execute probe.",
-		}, []string{"name", "broker"})
-
-	logger = log.New(os.Stderr, "", log.Lmicroseconds|log.Ltime|log.Lshortfile)
-
+	logger        = log.New(os.Stderr, "", log.Lmicroseconds|log.Ltime|log.Lshortfile)
 	configFile    = flag.String("config.file", "config.yaml", "Exporter configuration file.")
 	listenAddress = flag.String("web.listen-address", ":9214", "The address to listen on for HTTP requests.")
 )
 
-func init() {
-	prometheus.MustRegister(probeStarted)
-	prometheus.MustRegister(probeDuration)
-	prometheus.MustRegister(probeCompleted)
-	prometheus.MustRegister(messagesPublished)
-	prometheus.MustRegister(messagesReceived)
-
-	prometheus.MustRegister(timedoutTests)
-	prometheus.MustRegister(errors)
-}
-
-// Stolen from https://github.com/shoenig/go-mqtt/blob/master/samples/ssl.go
-func NewTlsConfig(probeConfig *probeConfig) *tls.Config {
+func NewTlsConfig(conf *config) *tls.Config {
 	// Import trusted certificates from CAChain - purely for verification - not sent to TLS server
 	certpool := x509.NewCertPool()
-	pemCerts, err := ioutil.ReadFile(probeConfig.CAChain)
+	pemCerts, err := ioutil.ReadFile(conf.CAChain)
 	if err == nil {
 		certpool.AppendCertsFromPEM(pemCerts)
 	}
@@ -107,7 +50,7 @@ func NewTlsConfig(probeConfig *probeConfig) *tls.Config {
 	// Import client certificate/key pair
 	// If you want the chain certs to be sent to the server, concatenate the leaf,
 	//  intermediate and root into the ClientCert file
-	cert, err := tls.LoadX509KeyPair(probeConfig.ClientCert, probeConfig.ClientKey)
+	cert, err := tls.LoadX509KeyPair(conf.ClientCert, conf.ClientKey)
 	if err != nil {
 		return &tls.Config{}
 	}
@@ -128,81 +71,50 @@ func NewTlsConfig(probeConfig *probeConfig) *tls.Config {
 	}
 }
 
-func startProbe(probeConfig *probeConfig) {
-	num := probeConfig.Messages
-	testTimeout := 10 * time.Second
-	qos := byte(0)
-	t0 := time.Now()
+func StartMqtt(conf *config) {
+	// testTimeout := 10 * time.Second
+	queue := make(chan mqtt.Message)
 
-	// Initialize optional metrics with initial values to have them present from the beginning
-	messagesPublished.WithLabelValues(probeConfig.Name, probeConfig.Broker).Add(0)
-	messagesReceived.WithLabelValues(probeConfig.Name, probeConfig.Broker).Add(0)
-	errors.WithLabelValues(probeConfig.Name, probeConfig.Broker).Add(0)
-	timedoutTests.WithLabelValues(probeConfig.Name, probeConfig.Broker).Add(0)
+	tlsconfig := NewTlsConfig(conf)
 
-	// Starting to fill metric vectors with meaningful values
-	probeStarted.WithLabelValues(probeConfig.Name, probeConfig.Broker).Inc()
-	defer func() {
-		probeCompleted.WithLabelValues(probeConfig.Name, probeConfig.Broker).Inc()
-		probeDuration.WithLabelValues(probeConfig.Name, probeConfig.Broker).Observe(time.Since(t0).Seconds())
-	}()
+	subscriberOptions := mqtt.NewClientOptions().SetClientID(fmt.Sprintf("%s-promethues", conf.ClientName))
+	subscriberOptions.SetUsername(conf.Username)
+	subscriberOptions.SetPassword(conf.Password)
+	subscriberOptions.SetTLSConfig(tlsconfig)
+	subscriberOptions.AddBroker(conf.Broker)
 
-	queue := make(chan [2]string)
-	reportError := func(error error) {
-		errors.WithLabelValues(probeConfig.Name, probeConfig.Broker).Inc()
-		logger.Print(error)
+	MqttClient := mqtt.NewClient(subscriberOptions)
+
+	OnMqttMessage := func(client mqtt.Client, message mqtt.Message) {
+		queue <- message
 	}
 
-	tlsconfig := NewTlsConfig(probeConfig)
-
-	publisherOptions := mqtt.NewClientOptions().SetClientID(fmt.Sprintf("%s-p", probeConfig.ClientPrefix)).SetUsername(probeConfig.Username).SetPassword(probeConfig.Password).SetTLSConfig(tlsconfig).AddBroker(probeConfig.Broker)
-
-	subscriberOptions := mqtt.NewClientOptions().SetClientID(fmt.Sprintf("%s-s", probeConfig.ClientPrefix)).SetUsername(probeConfig.Username).SetPassword(probeConfig.Password).SetTLSConfig(tlsconfig).AddBroker(probeConfig.Broker)
-
-	subscriberOptions.SetDefaultPublishHandler(func(client mqtt.Client, msg mqtt.Message) {
-		queue <- [2]string{msg.Topic(), string(msg.Payload())}
-	})
-
-	publisher := mqtt.NewClient(publisherOptions)
-	subscriber := mqtt.NewClient(subscriberOptions)
-
-	if token := publisher.Connect(); token.Wait() && token.Error() != nil {
-		reportError(token.Error())
-		return
-	}
-	defer publisher.Disconnect(5)
-
-	if token := subscriber.Connect(); token.Wait() && token.Error() != nil {
-		reportError(token.Error())
-		return
-	}
-	defer subscriber.Disconnect(5)
-
-	if token := subscriber.Subscribe(probeConfig.Topic, qos, nil); token.Wait() && token.Error() != nil {
-		reportError(token.Error())
-		return
-	}
-	defer subscriber.Unsubscribe(probeConfig.Topic)
-
-	timeout := time.After(testTimeout)
-	timeoutTriggered := false
-	receiveCount := 0
-
-	for i := 0; i < num; i++ {
-		text := fmt.Sprintf("this is msg #%d!", i)
-		token := publisher.Publish(probeConfig.Topic, qos, false, text)
-		token.Wait()
-		messagesPublished.WithLabelValues(probeConfig.Name, probeConfig.Broker).Inc()
+	if token := MqttClient.Connect(); token.Wait() && token.Error() != nil {
+		panic(token.Error())
 	}
 
-	for receiveCount < num && !timeoutTriggered {
+	SubscribeString := fmt.Sprintf("%s/#", conf.Topic)
+	if token := MqttClient.Subscribe(SubscribeString, 0, OnMqttMessage); token.Wait() && token.Error() != nil {
+		fmt.Println(token.Error())
+	}
+
+	ReTemperature := regexp.MustCompile(fmt.Sprintf("%s/(?P<Esp_MAC>[0-9ABCDEF]+)/temperature", conf.Topic))
+	//	ReRescan := regexp.MustCompile(fmt.Sprintf("%s/(?P<Esp_MAC>[0-9ABCDEF]+)/rescan_temperature", conf.Topic))
+
+	for {
 		select {
-		case <-queue:
-			receiveCount++
-			messagesReceived.WithLabelValues(probeConfig.Name, probeConfig.Broker).Inc()
-		case <-timeout:
-			timedoutTests.WithLabelValues(probeConfig.Name, probeConfig.Broker).Inc()
-			timeoutTriggered = true
+		case msg := <-queue:
+
+			group := ReTemperature.FindStringSubmatch(msg.Topic())
+			if group != nil {
+				mac, err := strconv.ParseInt(group[1], 16, 64)
+				if err != nil {
+					log.Fatalf("%v", err)
+				}
+
+				DS18b20ReadTemperature(uint64(mac), msg.Payload())
+				continue
+			}
 		}
 	}
 }
@@ -215,29 +127,25 @@ func main() {
 		logger.Fatalf("Error reading config file: %s", err)
 	}
 
-	config := config{}
+	conf = config{}
 
-	err = yaml.Unmarshal(yamlFile, &config)
+	err = yaml.Unmarshal(yamlFile, &conf)
 	if err != nil {
 		logger.Fatalf("Error parsing config file: %s", err)
 	}
 
 	logger.Printf("Starting mqtt_blackbox_exporter (build: %s)\n", build)
 
-	for _, probe := range config.Probes {
+	logger.Printf("Name:%s\n", conf.Name)
+	logger.Printf("Borker:%s\n", conf.Broker)
+	logger.Printf("Topic:%s\n", conf.Topic)
+	logger.Printf("Client Name:%s\n", conf.ClientName)
+	logger.Printf("Username:%s\n", conf.Username)
+	logger.Printf("Password:%s\n", conf.Password)
+	logger.Printf("Sensor Timeout:%s\n", conf.Ds18b20Timeout)
 
-		delay := probe.TestInterval
-		if delay == 0 {
-			delay = 60 * time.Second
-		}
-		go func(probeConfig probeConfig) {
-			for {
-				startProbe(&probeConfig)
-				time.Sleep(delay)
-			}
-		}(probe)
-	}
+	go StartMqtt(&conf)
 
-	http.Handle("/metrics", prometheus.Handler())
+	http.Handle("/metrics", ESP_Handler())
 	http.ListenAndServe(*listenAddress, nil)
 }
